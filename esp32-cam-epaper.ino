@@ -24,7 +24,6 @@
 #define LED_LEDC_CHANNEL 2 // Using different ledc channel/timer than camera
 #define CONFIG_LED_MAX_INTENSITY 255
 
-// #include <GxEPD2_BW.h>
 #include <GxEPD2_4G_4G.h>
 #include <GxEPD2_4G_BW.h>
 #include <esp_camera.h>
@@ -52,21 +51,19 @@ GxEPD2_4G_BW_R<GxEPD2_DRIVER_CLASS, MAX_HEIGHT_BW(GxEPD2_DRIVER_CLASS)> display_
 #undef MAX_HEIGHT_4G
 #undef GxEPD2_DRIVER_CLASS
 
-//#define SHOW_GRAY_SCALE // Teste screen gray scale
+#define SHOW_GRAY_SCALE // To check screen
 
 SPIClass hspi(HSPI);
 
 void setup() {
   Serial.begin(115200);
-  delay(5000); // wait ArduinoIDE
+  delay(1000); // wait ArduinoIDE
   Serial.setDebugOutput(true);
   Serial.println();
   Serial.println("setup");
-
   show_memory("[setup] memory");
 
   init_camera();
-  delay(5000); // wait ArduinoIDE
 
   hspi.begin(14, 12, 13, 15); // remap hspi for EPD (swap pins)(sck, miso, mosi, ss)
   display.epd2.selectSPI(hspi, SPISettings(4000000, MSBFIRST, SPI_MODE0));
@@ -87,21 +84,13 @@ void loop() {
 
   uint8_t * buf = NULL;
   size_t buf_len = 0;
-  enable_led(false);
   if(take_photo(&buf, &buf_len) == ESP_FAIL) {
     Serial.println("Fail to take photo");
   }
-  enable_led(false);
   
-  // Serial.print("buffer length:");Serial.println(buf_len);
-  // esp_err_t err = esp_camera_deinit();
-  // if(err != ESP_OK) {
-  //   Serial.printf("Camera deinit failed with error 0x%x", err);
-  // }
-
   if(buf_len > 0) {
     display.setRotation(0);
-    drawBitmap(buf, buf_len, true);
+    drawBitmap(buf, buf_len);
     Serial.println("image printed");
 
     Serial.println("cleaning memory");
@@ -159,19 +148,12 @@ void init_camera(void) {
   }
 
   sensor_t * s = esp_camera_sensor_get();
-  /*
-  // initial sensors are flipped vertically and colors are a bit saturated
-  if (s->id.PID == OV3660_PID) {
-    s->set_vflip(s, 1); // flip it back
-    s->set_brightness(s, 1); // up the brightness just a bit
-    s->set_saturation(s, -2); // lower the saturation
-  }
-  */
 
   // Setup LED FLash if LED pin is defined in camera_pins.h
   setupLedFlash(LED_GPIO_NUM);
 
-  //s->set_framesize(s, FRAMESIZE_SVGA);
+  s->set_brightness(s, 1); // up the brightness just a bit
+  s->set_contrast(s, 2); // lower the saturation
   s->set_framesize(s, FRAMESIZE_VGA);
   s->set_special_effect(s, 2);
   enable_led(false);
@@ -179,6 +161,7 @@ void init_camera(void) {
 
 esp_err_t take_photo(uint8_t ** out, size_t * out_len) {
   camera_fb_t *fb = NULL;
+  delay(5000);
   fb = esp_camera_fb_get();
   if (!fb) {
       Serial.println("Camera capture failed");
@@ -217,23 +200,12 @@ static const uint16_t input_buffer_pixels = 800; // may affect performance
 static const uint16_t max_row_width = 1872; // for up to 7.8" display 1872x1404
 static const uint16_t max_palette_pixels = 256; // for depth <= 8
 
-uint8_t input_buffer[3 * input_buffer_pixels]; // up to depth 24
-uint8_t output_row_mono_buffer[max_row_width / 8]; // buffer for at least one row of b/w bits
-uint8_t output_row_color_buffer[max_row_width / 8]; // buffer for at least one row of color bits
-uint8_t mono_palette_buffer[max_palette_pixels / 8]; // palette buffer for depth <= 8 b/w
-uint8_t color_palette_buffer[max_palette_pixels / 8]; // palette buffer for depth <= 8 c/w
-uint16_t rgb_palette_buffer[max_palette_pixels]; // palette buffer for depth <= 8 for buffered graphics, needed for 7-color display
-
-//void drawBitmapFromSpiffs_Buffered(const char *filename, int16_t x, int16_t y, bool with_color, bool partial_update, bool overwrite)
-void drawBitmap(uint8_t *bmp, size_t bmp_len, bool with_color) {
+void drawBitmap(uint8_t *bmp, size_t bmp_len) {
   size_t start = 0;
-  bool partial_update = false; 
-  bool overwrite = false;
   bool valid = false; // valid format to be handled
   bool flip = true; // bitmap is stored bottom-to-top
   bool has_multicolors = true; // (display.epd2.panel == GxEPD2::ACeP565) || (display.epd2.panel == GxEPD2::GDEY073D46);
   uint32_t startTime = millis();
-  //if ((x >= display.width()) || (y >= display.height())) return;
   // Parse BMP header
   if (read16(bmp, bmp_len, start) == 0x4D42) { // BMP signature
     uint32_t fileSize = read32(bmp, bmp_len, start);
@@ -246,7 +218,7 @@ void drawBitmap(uint8_t *bmp, size_t bmp_len, bool with_color) {
     uint16_t depth = read16(bmp, bmp_len, start); // bits per pixel
     uint32_t format = read32(bmp, bmp_len, start);
 
-    if ((planes == 1) && ((format == 0) || (format == 3))) { // uncompressed is handled, 565 also
+    if (depth == 24 && planes == 1 && ((format == 0) || (format == 3))) { // uncompressed is handled, 565 also
       Serial.print("File size: "); Serial.println(fileSize);
       Serial.print("Image Offset: "); Serial.println(imageOffset);
       Serial.print("Header size: "); Serial.println(headerSize);
@@ -267,109 +239,42 @@ void drawBitmap(uint8_t *bmp, size_t bmp_len, bool with_color) {
       uint16_t h = height;
       if ((x + w - 1) >= display.width())  w = display.width()  - x;
       if ((y + h - 1) >= display.height()) h = display.height() - y;
+
       valid = true;
       uint8_t bitmask = 0xFF;
       uint8_t bitshift = 8 - depth;
       uint16_t red, green, blue;
-      bool whitish = false;
-      bool colored = false;
-      if (depth == 1) with_color = false;
-      if (depth <= 8) {
-        if (depth < 8) bitmask >>= depth;
-        start = imageOffset; //palette is always @ 54
-        for (uint16_t pn = 0; pn < (1 << depth); pn++) {
-          blue  = read8(bmp, bmp_len, start);
-          green = read8(bmp, bmp_len, start);
-          red   = read8(bmp, bmp_len, start);
-          start++;
-          whitish = with_color ? ((red > 0x80) && (green > 0x80) && (blue > 0x80)) : ((red + green + blue) > 3 * 0x80); // whitish
-          colored = (red > 0xF0) || ((green > 0xF0) && (blue > 0xF0)); // reddish or yellowish?
-          if (0 == pn % 8) mono_palette_buffer[pn / 8] = 0;
-          mono_palette_buffer[pn / 8] |= whitish << pn % 8;
-          if (0 == pn % 8) color_palette_buffer[pn / 8] = 0;
-          color_palette_buffer[pn / 8] |= colored << pn % 8;
-          rgb_palette_buffer[pn] = ((red & 0xF8) << 8) | ((green & 0xFC) << 3) | ((blue & 0xF8) >> 3);
-        }
-      }
-      if (partial_update) display.setPartialWindow(x, y, w, h);
-      else display.setFullWindow();
+      
+      display.setFullWindow();
       display.firstPage();
+      display.fillScreen(GxEPD_WHITE);
       do {
-        if (!overwrite) display.fillScreen(GxEPD_WHITE);
         uint32_t rowPosition = flip ? imageOffset + (height - h) * rowSize : imageOffset;
         for (uint16_t row = 0; row < h; row++, rowPosition += rowSize) {
-          uint8_t in_byte = 0; // for depth <= 8
-          uint8_t in_bits = 0; // for depth <= 8
+          uint8_t gray = 0;
+          uint8_t level = 0;
           uint16_t color = GxEPD_WHITE;
           start = rowPosition;
           for (uint16_t col = 0; col < w; col++) { // for each pixel
-            switch (depth) {
-              case 32:
-                blue = read8(bmp, bmp_len, start);
-                green = read8(bmp, bmp_len, start);
-                red = read8(bmp, bmp_len, start);
-                start++; // skip alpha
-                whitish = with_color ? ((red > 0x80) && (green > 0x80) && (blue > 0x80)) : ((red + green + blue) > 3 * 0x80); // whitish
-                colored = (red > 0xF0) || ((green > 0xF0) && (blue > 0xF0)); // reddish or yellowish?
-                color = ((red & 0xF8) << 8) | ((green & 0xFC) << 3) | ((blue & 0xF8) >> 3);
-                break;
-              case 24:
-                blue = read8(bmp, bmp_len, start);
-                green = read8(bmp, bmp_len, start);
-                red = read8(bmp, bmp_len, start);
-                whitish = with_color ? ((red > 0x80) && (green > 0x80) && (blue > 0x80)) : ((red + green + blue) > 3 * 0x80); // whitish
-                colored = (red > 0xF0) || ((green > 0xF0) && (blue > 0xF0)); // reddish or yellowish?
-                color = ((red & 0xF8) << 8) | ((green & 0xFC) << 3) | ((blue & 0xF8) >> 3);
-                break;
-              case 16:
-                {
-                  uint8_t lsb = read8(bmp, bmp_len, start);
-                  uint8_t msb = read8(bmp, bmp_len, start);
-                  if (format == 0) // 555
-                  {
-                    blue  = (lsb & 0x1F) << 3;
-                    green = ((msb & 0x03) << 6) | ((lsb & 0xE0) >> 2);
-                    red   = (msb & 0x7C) << 1;
-                    color = ((red & 0xF8) << 8) | ((green & 0xFC) << 3) | ((blue & 0xF8) >> 3);
-                  }
-                  else // 565
-                  {
-                    blue  = (lsb & 0x1F) << 3;
-                    green = ((msb & 0x07) << 5) | ((lsb & 0xE0) >> 3);
-                    red   = (msb & 0xF8);
-                    color = (msb << 8) | lsb;
-                  }
-                  whitish = with_color ? ((red > 0x80) && (green > 0x80) && (blue > 0x80)) : ((red + green + blue) > 3 * 0x80); // whitish
-                  colored = (red > 0xF0) || ((green > 0xF0) && (blue > 0xF0)); // reddish or yellowish?
-                }
-                break;
-              case 1:
-              case 2:
-              case 4:
-              case 8:
-                {
-                  if (0 == in_bits)
-                  {
-                    in_byte = read8(bmp, bmp_len, start);
-                    in_bits = 8;
-                  }
-                  uint16_t pn = (in_byte >> bitshift) & bitmask;
-                  whitish = mono_palette_buffer[pn / 8] & (0x1 << pn % 8);
-                  colored = color_palette_buffer[pn / 8] & (0x1 << pn % 8);
-                  in_byte <<= depth;
-                  in_bits -= depth;
-                  color = rgb_palette_buffer[pn];
-                }
-                break;
-            }
-            if (with_color && has_multicolors) {
-              // keep color
-            } else if (whitish) {
-              color = GxEPD_WHITE;
-            } else if (colored && with_color) {
-              color = GxEPD_COLORED;
-            } else {
-              color = GxEPD_BLACK;
+            blue = read8(bmp, bmp_len, start);
+            green = read8(bmp, bmp_len, start);
+            red = read8(bmp, bmp_len, start);
+            color = ((red & 0xF8) << 8) | ((green & 0xFC) << 3) | ((blue & 0xF8) >> 3);
+
+            gray = 0.3 * red + 0.59 * green + 0.11 * blue;
+            level = gray / 64;
+            red = level * 64;
+            green = level * 64;
+            blue = level * 64;
+
+            if (red == 0) {
+                color = GxEPD_BLACK;
+            } else if (red == 64) {
+                color = GxEPD_DARKGREY;
+            } else if (red == 128) {
+                color = GxEPD_LIGHTGREY;
+            } else if (red == 192) {
+                color = GxEPD_WHITE;
             }
             uint16_t yrow = y + (flip ? h - row - 1 : row);
             display.drawPixel(x + col, yrow, color);
@@ -447,103 +352,3 @@ void showGreyLevels() {
   delay(2000);
 }
 #endif
-
-/*
-#include <stdio.h>
-#include <stdlib.h>
-
-typedef struct {
-    unsigned char blue;
-    unsigned char green;
-    unsigned char red;
-} Pixel;
-
-int main() {
-    FILE *input_file = fopen("input.bmp", "rb");
-    FILE *output_file = fopen("output.bmp", "wb");
-
-    // Read BMP header
-    // ...
-
-    // Read pixel data
-    Pixel *pixels = malloc(sizeof(Pixel) * width * height);
-    fread(pixels, sizeof(Pixel), width * height, input_file);
-
-    // Convert pixels to grayscale
-    for (int i = 0; i < width * height; i++) {
-        unsigned char gray = 0.3 * pixels[i].red + 0.59 * pixels[i].green + 0.11 * pixels[i].blue;
-        unsigned char level = gray / 64;
-        pixels[i].red = level * 64;
-        pixels[i].green = level * 64;
-        pixels[i].blue = level * 64;
-    }
-
-    // Write new pixel data
-    fwrite(pixels, sizeof(Pixel), width * height, output_file);
-
-    fclose(input_file);
-    fclose(output_file);
-}
-
-
-
-#include <GxEPD2.h>
-#include <GxGDEW042T2/GxGDEW042T2.h>
-
-#define EPD_CS 5
-#define EPD_DC 17
-#define EPD_RST 16
-#define EPD_BUSY 4
-
-GxEPD2_BW<GxEPD2_420_T2> display(GxEPD2_420_T2(EPD_CS, EPD_DC, EPD_RST, EPD_BUSY));
-
-typedef struct {
-    unsigned char blue;
-    unsigned char green;
-    unsigned char red;
-} Pixel;
-
-void setup() {
-    display.init(115200);
-}
-
-void loop() {
-    FILE *input_file = fopen("input.bmp", "rb");
-
-    // Read BMP header
-    // ...
-
-    // Read pixel data
-    Pixel *pixels = malloc(sizeof(Pixel) * width * height);
-    fread(pixels, sizeof(Pixel), width * height, input_file);
-
-    // Convert pixels to grayscale
-    for (int i = 0; i < width * height; i++) {
-        unsigned char gray = 0.3 * pixels[i].red + 0.59 * pixels[i].green + 0.11 * pixels[i].blue;
-        unsigned char level = gray / 64;
-        pixels[i].red = level * 64;
-        pixels[i].green = level * 64;
-        pixels[i].blue = level * 64;
-    }
-
-    // Write new pixel data to display
-    display.fillScreen(GxEPD_WHITE);
-    for (int y = 0; y < height; y++) {
-        for (int x = 0; x < width; x++) {
-            int i = y * width + x;
-            if (pixels[i].red == 0) {
-                display.drawPixel(x, y, GxEPD_BLACK);
-            } else if (pixels[i].red == 64) {
-                display.drawPixel(x, y, GxEPD_DARK_GRAY);
-            } else if (pixels[i].red == 128) {
-                display.drawPixel(x, y, GxEPD_LIGHT_GRAY);
-            } else if (pixels[i].red == 192) {
-                display.drawPixel(x, y, GxEPD_WHITE);
-            }
-        }
-    }
-    display.update();
-
-    fclose(input_file);
-}
-*/
