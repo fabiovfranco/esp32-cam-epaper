@@ -25,14 +25,14 @@ Just a POC to validate if it is possible to print a photo from esp32-cam directl
 
 Connections from the platform with the esp32-cam:
 
-BUSY - PURPLE - IO12
-RST - WHITE - IO2
-DC - GREEN - IO3/UnR (can use IO4 during development)
-CS - ORANGE - IO15
-CLK - YELLOW - IO14
-DIN - BLUE - IO13
-GND - BROWN - GND (next to 3v3)
-VCC - GRAY - 3V3
+BUSY - PURPLE - IO12  
+RST - WHITE - IO2  
+DC - GREEN - IO3/UnR (can use IO4 during development)  
+CS - ORANGE - IO15  
+CLK - YELLOW - IO14  
+DIN - BLUE - IO13  
+GND - BROWN - GND (next to 3v3)  
+VCC - GRAY - 3V3  
 
 Important:
 - I did not use IO16 as BUSY because using this IO corrupts PSRAM memory.
