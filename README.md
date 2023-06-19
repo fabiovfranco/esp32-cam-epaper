@@ -54,4 +54,5 @@ Important:
 - https://github.com/ZinggJM/GxEPD2_4G/blob/master/examples/GxEPD2_4G_MixedExample/GxEPD2_4G_MixedExample.ino
 - https://github.com/espressif/arduino-esp32/tree/master/libraries/ESP32/examples/Camera/CameraWebServer
 - https://hackaday.com/2023/02/10/an-instant-camera-using-e-paper-as-film/
+- https://github.com/deeptronix/dithering_halftoning
 - Bing Chat :)

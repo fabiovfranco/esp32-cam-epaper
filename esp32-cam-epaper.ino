@@ -24,6 +24,24 @@
 #define LED_LEDC_CHANNEL 2 // Using different ledc channel/timer than camera
 #define CONFIG_LED_MAX_INTENSITY 255
 
+
+typedef struct {
+  uint32_t filesize;
+  uint32_t reserved;
+  uint32_t offset;
+  uint32_t headersize;
+  int32_t width;
+  int32_t height;
+  uint16_t planes;
+  uint16_t bitsPerPixel; // depth
+  uint32_t compression; // format
+  uint32_t imageSize;
+  uint32_t xPixelsPerMeter;
+  uint32_t yPixelsPerMeter;
+  uint32_t colorsUsed;
+  uint32_t colorsImportant;
+} bmp_header;
+
 #include <GxEPD2_4G_4G.h>
 #include <GxEPD2_4G_BW.h>
 #include <esp_camera.h>
@@ -51,9 +69,11 @@ GxEPD2_4G_BW_R<GxEPD2_DRIVER_CLASS, MAX_HEIGHT_BW(GxEPD2_DRIVER_CLASS)> display_
 #undef MAX_HEIGHT_4G
 #undef GxEPD2_DRIVER_CLASS
 
-#define SHOW_GRAY_SCALE // To check screen
+// #define SHOW_GRAY_SCALE // To check screen
 
 SPIClass hspi(HSPI);
+
+uint16_t gamme_curve[256];
 
 void setup() {
   Serial.begin(115200);
@@ -73,6 +93,7 @@ void setup() {
   Serial.println();
   Serial.println("display initialized");
 
+  make_gamma_curve(0.8);
 #ifdef SHOW_GRAY_SCALE
   showGreyLevels();
 #endif
@@ -90,7 +111,9 @@ void loop() {
   
   if(buf_len > 0) {
     display.setRotation(0);
-    drawBitmap(buf, buf_len);
+    //drawBitmap(buf, buf_len, false);
+    //delay(2000);
+    drawBitmap(buf, buf_len, true);
     Serial.println("image printed");
 
     Serial.println("cleaning memory");
@@ -101,6 +124,35 @@ void loop() {
 
   show_memory("[l2] memory");
   delay(10000);
+}
+
+void make_gamma_curve(double gamma_value) {
+  // Affects the gamma to calculate gray (lower is darker/higher contrast)
+  // Nice test values: 0.9 1.2 1.4 higher and is too bright
+  double gammaCorrection = 1.0 / gamma_value;
+  uint8_t val = 0;
+  uint16_t color = 0;
+  Serial.println("Gamma correction scale: ");
+  for (int gray_value=0; gray_value<256;gray_value++) {
+    val = round(255*pow(gray_value/255.0, gammaCorrection));
+    //0, 85, 170, 255
+    if (val <= 64) { // 64
+      color = GxEPD_BLACK;
+      // Serial.print(val);Serial.println(" B");
+    } else if (val <= 128) { // 128
+      color = GxEPD_DARKGREY;
+      // Serial.print(val);Serial.println(" D");
+    } else if (val <= 192) { // 192
+      color = GxEPD_LIGHTGREY;
+      // Serial.print(val);Serial.println(" L");
+    } else {
+      color = GxEPD_WHITE;
+      // Serial.print(val);Serial.println(" W");
+    }
+
+    gamme_curve[gray_value] = color;
+  }
+  // Serial.println("");
 }
 
 void init_camera(void) {
@@ -152,8 +204,8 @@ void init_camera(void) {
   // Setup LED FLash if LED pin is defined in camera_pins.h
   setupLedFlash(LED_GPIO_NUM);
 
-  s->set_brightness(s, 1); // up the brightness just a bit
-  s->set_contrast(s, 2); // lower the saturation
+  //s->set_brightness(s, 1); // up the brightness just a bit
+  //s->set_contrast(s, 2); // lower the saturation
   s->set_framesize(s, FRAMESIZE_VGA);
   s->set_special_effect(s, 2);
   enable_led(false);
@@ -200,128 +252,190 @@ static const uint16_t input_buffer_pixels = 800; // may affect performance
 static const uint16_t max_row_width = 1872; // for up to 7.8" display 1872x1404
 static const uint16_t max_palette_pixels = 256; // for depth <= 8
 
-void drawBitmap(uint8_t *bmp, size_t bmp_len) {
-  size_t start = 0;
+#define END (-32)
+
+void dithering(uint8_t *bmp, uint16_t w, uint16_t h, uint8_t bpp) {
+  Serial.printf("Start dithering (%dx%d) %dbpp\n", w, h ,bpp);
+  uint8_t quantization_bits = 7;
+  uint8_t weights[16];
+  uint8_t len = 1;
+  uint8_t max_filt_height = 0, max_filt_width = 0;
+  int8_t _filters[] = {16, 7, -1, 3, 5, 1, END};
+  for(; _filters[len] > END; len++) {
+    weights[len] = _filters[len];
+    if(weights[len] > 0) {
+      if(max_filt_height == 0) {
+        max_filt_width++;	 // find the filter right-side length; assuming the longest row is the first one.
+      }
+    } else {
+      max_filt_height++;	// find the filter height
+    }
+  }
+
+  uint8_t r = 0, newr = 0, dummy = 0, curr_weight = 0;
+  int16_t temp_r = 0, quant_err_r = 0;
+
+  bool bitshift_avail = 0;
+  uint8_t bitshift_div = 0;
+  uint8_t divisor = 16;
+  if(is_2s_pow(divisor)) {
+    bitshift_avail = 1;
+    bitshift_div = twos_power(divisor);
+  }
+  
+  for (uint16_t row = 0; row < h; row++) {
+    for (uint16_t col = 0; col < w; col++) {
+      uint32_t ind = index(col, row * w, bpp);
+      uint8_t color = bmp[ind];
+      colorGray256To888(color, r, dummy, dummy);
+      newr = r;
+      quantize(quantization_bits, newr, dummy, dummy);
+      quant_err_r = r - newr;
+      bmp[ind] = color888ToGray256(newr, newr, newr);
+
+      // Distribute error amongst neighbours
+      int8_t row_offs = 0, col_offs = 1;
+
+      for(uint8_t p = 1; p < len; p++) {	//  fetch current filter weight
+        // adjacent pixels work starts here. First, check if away from edge cases:
+        if(row < (h - max_filt_height)  &&  col < (w - max_filt_width)  &&  col > 0) {
+          
+          // Fetch current dithering weight
+          curr_weight = weights[p];
+          
+          if(curr_weight < 0) {		// Negative values in the weights array indicates to go down to the next line, and by which amount to the left
+            col_offs = curr_weight;
+            row_offs++;			// linefeed
+          } else {		// If not outside image boundaries
+            ind = index(col + col_offs, (row + row_offs) * w, bpp);
+            col_offs++;
+            
+            // Fetch pixel and convert it to RGB888
+            colorGray256To888(bmp[ind], r, dummy, dummy);
+            
+            if(!bitshift_avail) {		// If divisor is not a power of 2, bitshift division is not possible.
+              temp_r = r + ((quant_err_r * curr_weight) / divisor);
+            } else{				// On most uCs, bitshift division is quite cycle-expensive. Whenever possible, use bitshift. On the other hand, multiplication is often single-cycle.
+              temp_r = r + ((quant_err_r * curr_weight) >> bitshift_div);
+            }
+            
+            // Clamp pixel value if outside range [0-255]
+            r = clamp(temp_r, 0, 255);
+            
+            // Assign new pixel value (each neighbour)
+            bmp[ind] = color888ToGray256(r, r, r);
+          }
+        }
+      }
+    }
+  }
+  Serial.println("End dithering");
+}
+
+void drawBitmap(uint8_t *bmp, size_t bmp_len, bool dither) {
+  if (bmp_len < 54 || bmp[0] != 'B' || bmp[1] != 'M') { // BMP signature
+    Serial.print("Invalid bmp size.");
+    return;
+  }
+
+  Serial.print("Image magic: ");Serial.print((char)bmp[0]);Serial.println((char)bmp[1]);
+  if (bmp[0] != 'B' || bmp[1] != 'M') { // BMP signature
+    Serial.print("Invalid bmp file signature.");
+    return;
+  }
+  bmp_header *image = (bmp_header *)&bmp[2];
+  uint8_t *data = &bmp[image->offset];
+  
   bool valid = false; // valid format to be handled
   bool flip = true; // bitmap is stored bottom-to-top
-  bool has_multicolors = true; // (display.epd2.panel == GxEPD2::ACeP565) || (display.epd2.panel == GxEPD2::GDEY073D46);
   uint32_t startTime = millis();
   // Parse BMP header
-  if (read16(bmp, bmp_len, start) == 0x4D42) { // BMP signature
-    uint32_t fileSize = read32(bmp, bmp_len, start);
-    uint32_t creatorBytes = read32(bmp, bmp_len, start); (void)creatorBytes; //unused
-    uint32_t imageOffset = read32(bmp, bmp_len, start); // Start of image data
-    uint32_t headerSize = read32(bmp, bmp_len, start);
-    uint32_t width  = read32(bmp, bmp_len, start);
-    int32_t height = (int32_t) read32(bmp, bmp_len, start);
-    uint16_t planes = read16(bmp, bmp_len, start);
-    uint16_t depth = read16(bmp, bmp_len, start); // bits per pixel
-    uint32_t format = read32(bmp, bmp_len, start);
-
-    if (depth == 24 && planes == 1 && ((format == 0) || (format == 3))) { // uncompressed is handled, 565 also
-      Serial.print("File size: "); Serial.println(fileSize);
-      Serial.print("Image Offset: "); Serial.println(imageOffset);
-      Serial.print("Header size: "); Serial.println(headerSize);
-      Serial.print("Bit Depth: "); Serial.println(depth);
-      Serial.print("Image size: ");Serial.print(width);Serial.print('x');Serial.println(height);
-      // BMP rows are padded (if needed) to 4-byte boundary
-      uint32_t rowSize = (width * depth / 8 + 3) & ~3;
-      if (depth < 8) rowSize = ((width * depth + 8 - depth) / 8 + 3) & ~3;
-      if (height < 0) {
-        height = -height;
-        flip = false;
-      }
-
-      int16_t x = (display.width() - width) / 2;
-      int16_t y = (display.height() - height) / 2;
-
-      uint16_t w = width;
-      uint16_t h = height;
-      if ((x + w - 1) >= display.width())  w = display.width()  - x;
-      if ((y + h - 1) >= display.height()) h = display.height() - y;
-
-      valid = true;
-      uint8_t bitmask = 0xFF;
-      uint8_t bitshift = 8 - depth;
-      uint16_t red, green, blue;
-      
-      display.setFullWindow();
-      display.firstPage();
-      display.fillScreen(GxEPD_WHITE);
-      do {
-        uint32_t rowPosition = flip ? imageOffset + (height - h) * rowSize : imageOffset;
-        for (uint16_t row = 0; row < h; row++, rowPosition += rowSize) {
-          uint8_t gray = 0;
-          uint8_t level = 0;
-          uint16_t color = GxEPD_WHITE;
-          start = rowPosition;
-          for (uint16_t col = 0; col < w; col++) { // for each pixel
-            blue = read8(bmp, bmp_len, start);
-            green = read8(bmp, bmp_len, start);
-            red = read8(bmp, bmp_len, start);
-            color = ((red & 0xF8) << 8) | ((green & 0xFC) << 3) | ((blue & 0xF8) >> 3);
-
-            gray = 0.3 * red + 0.59 * green + 0.11 * blue;
-            level = gray / 64;
-            red = level * 64;
-            green = level * 64;
-            blue = level * 64;
-
-            if (red == 0) {
-                color = GxEPD_BLACK;
-            } else if (red == 64) {
-                color = GxEPD_DARKGREY;
-            } else if (red == 128) {
-                color = GxEPD_LIGHTGREY;
-            } else if (red == 192) {
-                color = GxEPD_WHITE;
-            }
-            uint16_t yrow = y + (flip ? h - row - 1 : row);
-            display.drawPixel(x + col, yrow, color);
-          } // end pixel
-        } // end line
-      }
-      while (display.nextPage());
-      Serial.print("loaded in "); Serial.print(millis() - startTime); Serial.println(" ms");
+  Serial.print("FileSize: "); Serial.println(image->filesize);
+  Serial.print("Offset: "); Serial.println(image->offset);
+  Serial.print("Bit Depth (bpp): "); Serial.println(image->bitsPerPixel);
+  Serial.print("Compression: "); Serial.println(image->compression);
+  if (image->bitsPerPixel == 24 && image->planes == 1 && ((image->compression == 0) || (image->compression == 3))) { // uncompressed is handled, 565 also
+    Serial.print("Image size: "); Serial.println(image->imageSize);
+    Serial.print("Image size: ");Serial.print(image->width);Serial.print('x');Serial.println(image->height);
+    // BMP rows are padded (if needed) to 4-byte boundary
+    uint32_t width = image->width;
+    int32_t height = image->height;
+    uint8_t bpp = image->bitsPerPixel / 8;
+    uint32_t rowSize = (width * bpp + 3) & ~3;
+    if (image->bitsPerPixel < 8) {
+      rowSize = ((width * image->bitsPerPixel + 8 - image->bitsPerPixel) / 8 + 3) & ~3;
     }
+    if (height < 0) {
+      height = -height;
+      flip = false;
+    }
+
+    int16_t x = (display.width() - width) / 2;
+    int16_t y = (display.height() - height) / 2;
+
+    uint16_t w = width;
+    uint16_t h = height;
+    if ((x + w - 1) >= display.width())  w = display.width()  - x;
+    if ((y + h - 1) >= display.height()) h = display.height() - y;
+
+    valid = true;
+    uint16_t red, green, blue;
+
+    if (dither) {
+      dithering(data, width, height, bpp);
+    }
+    
+    display.setFullWindow();
+    display.firstPage();
+    display.fillScreen(GxEPD_WHITE);
+    do {
+      uint32_t rowPosition = flip ? (height - h) * rowSize : 0;
+      for (uint16_t row = 0; row < h; row++, rowPosition += rowSize) {
+        uint8_t gray = 0;
+        uint8_t level = 0;
+        uint16_t color = GxEPD_WHITE;
+        uint32_t val;
+#ifdef SHOW_GRAY_SCALE
+        Serial.println("");
+#endif
+        for (uint16_t col = 0; col < w; col++) { // for each pixel
+          red = data[rowPosition + col * 3];
+          if(red > 255) {
+            Serial.print("red: ");Serial.println(red);
+            red = 255;
+          }
+          color = gamme_curve[red];
+          uint16_t yrow = y + (flip ? h - row - 1 : row);
+          display.drawPixel(x + col, yrow, color);
+
+#ifdef SHOW_GRAY_SCALE
+          switch (color) {
+            case GxEPD_WHITE:
+              Serial.print("W");
+              break;
+            case GxEPD_LIGHTGREY:
+              Serial.print("L");
+              break;
+            case GxEPD_DARKGREY:
+              Serial.print("D");
+              break;
+            case GxEPD_BLACK:
+              Serial.print("B");
+              break;
+            default:
+              Serial.print("?");
+              break;
+          }
+#endif            
+        } // end pixel
+      } // end line
+      Serial.println("");
+    } while (display.nextPage());
+    Serial.print("loaded in "); Serial.print(millis() - startTime); Serial.println(" ms");
   }
   if (!valid) {
     Serial.println("bitmap format not handled.");
   }
-}
-
-uint8_t read8(uint8_t buf[], size_t buf_len, size_t &start) {
-  if(start + 1 > buf_len) {
-    Serial.println("Skipping out of index buffer read.");
-     return 0;
-  }
-  return buf[start++];
-}
-
-uint16_t read16(uint8_t buf[], size_t buf_len, size_t &start) {
-  if(start + 2 > buf_len) {
-    Serial.println("Skipping out of index buffer read.");
-     return 0;
-  }
-  // BMP data is stored little-endian, same as Arduino.
-  uint16_t result;
-  ((uint8_t *)&result)[0] = buf[start++]; // LSB
-  ((uint8_t *)&result)[1] = buf[start++]; // MSB
-  return result;
-}
-
-int32_t read32(uint8_t buf[], size_t buf_len, size_t &start) {
-  if(start + 4 > buf_len) {
-    Serial.println("Skipping out of index buffer read.");
-     return 0;
-  }
-  // BMP data is stored little-endian, same as Arduino.
-  int32_t result;
-  ((uint8_t *)&result)[0] = buf[start++]; // LSB
-  ((uint8_t *)&result)[1] = buf[start++];
-  ((uint8_t *)&result)[2] = buf[start++];
-  ((uint8_t *)&result)[3] = buf[start++]; // MSB
-  return result;
 }
 
 void show_memory(char arr[]) {
@@ -330,6 +444,57 @@ void show_memory(char arr[]) {
   Serial.print("Free heap: ");Serial.println(ESP.getFreeHeap());
   Serial.print("Total PSRAM: ");Serial.println(ESP.getPsramSize());
   Serial.print("Free PSRAM: ");Serial.println(ESP.getFreePsram());
+}
+
+uint8_t color888ToGray256(uint8_t r, uint8_t g, uint8_t b) {
+  return ((r + g + b) / 3);
+}
+
+void colorGray256To888(uint8_t color, uint8_t &r, uint8_t &g, uint8_t &b) {
+  r = color;
+  g = color;
+  b = color;
+}
+
+bool colorGray256ToBool(uint8_t gs) {
+  return gs >> 7;
+}
+
+void quantize(uint8_t quant_bits, uint8_t &r, uint8_t &g, uint8_t &b){
+  uint8_t quant_step = 255 / ((1 << quant_bits) - 1);
+  uint8_t shifter = 8 - quant_bits;
+  r = ((uint16_t)r >> shifter) * quant_step;
+  g = ((uint16_t)g >> shifter) * quant_step;
+  b = ((uint16_t)b >> shifter) * quant_step;
+}
+
+void quantize_BW(uint8_t &c){
+  c = (int8_t)c >> 7;
+}
+
+bool is_2s_pow(uint16_t number) {
+    return !((number) & ((number) - 1));
+}
+
+uint8_t twos_power(uint16_t number){		// returns the position of the highest (MS) '1' in a power of 2 number
+	uint8_t l2 = 0;
+	while(number >>= 1){
+	  l2++;
+	}
+	return l2;
+}
+
+uint8_t clamp(int16_t v, uint8_t min, uint8_t max){	// Clamps values between a range inside [0 : 255] ; substitute "uint8_t min, uint8_t max" with "uint16_t ..." to extend this range.
+  uint16_t t = (v) < min ? min : (v);
+  return t > max ? max : t;
+}
+
+uint32_t index(uint32_t x, int32_t y, uint8_t bpp){		// ONLY for byte-aligned pixels (so monochrome or, generally speaking, single-byte color such as RGB332 format)
+  uint32_t result = (x+y)*bpp; 
+  if (result >= 921600 || result < 0) {
+   Serial.printf("Index: %d (%dx%d) \n", result, x, y);
+  }
+  return result;
 }
 
 #ifdef SHOW_GRAY_SCALE
